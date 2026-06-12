@@ -1,15 +1,26 @@
-"""RLHF Pipeline for GSM8K — Stage 1: SFT | Stage 2: PRM | Stage 3: PPO/GRPO"""
+"""RLHF Pipeline for GSM8K — Stage 1: SFT | Stage 2: PRM | Stage 3: PPO/GRPO
+
+``create_prm_dataset`` derives step-level labels *heuristically* from GSM8K reference solutions — it does NOT use human annotation.  Labels are assigned as follows:
+
+    correctness: 1.0 for steps from a gold solution; 0.0 if an inline <<expr=result>> annotation is numerically inconsistent.
+    math_validity: Same sanity check; 1.0 when no annotation exists.
+    clarity: Heuristic proxy based on word count.
+    progress: (step_index + 1) / total_steps.
+
+Because these labels are synthetic, the PRM trains on a proxy signal rather than true step-level correctness. Real PRM training requires human or verified-incorrect-trace labels (e.g., PRM800K).
+"""
 
 import argparse
 import logging
 import os
+import re
 
 import numpy as np
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 
 from datasets import load_dataset, Dataset
 from transformers import (
@@ -35,10 +46,10 @@ from peft import (
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger(__name__)
 
+IGNORE_INDEX = -100   # standard label mask value for CrossEntropyLoss
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  CONFIGURATION
-# ══════════════════════════════════════════════════════════════════════════════
+# Restricted eval environment arithmetic operators only, no builtins.
+_SAFE_EVAL_GLOBALS: Dict = {"__builtins__": {}}
 
 @dataclass
 class Config:
@@ -51,29 +62,32 @@ class Config:
     train_batch_size: int = 2
     eval_batch_size: int = 4
 
-    # Stage 1: SFT
+    #1 SFT
     sft_learning_rate: float = 2e-4
     sft_epochs: int = 3
     sft_warmup_steps: int = 100
 
-    # Stage 2: PRM
+    #2 PRM
     prm_learning_rate: float = 1e-4
     prm_epochs: int = 5
-    prm_hidden_size: int = 768
-    num_reward_heads: int = 4
+    prm_hidden_size: int = 768   # projection dimension for the reward heads
 
-    # Stage 3: PPO
+    #3 PPO
     ppo_learning_rate: float = 1e-5
-    ppo_num_epochs: int = 4
-    ppo_steps: int = 500
-    ppo_clip_ratio: float = 0.2
+    ppo_num_epochs: int = 4 # inner gradient epochs per rollout batch
+    ppo_steps: int = 500 # outer rollout steps
+    ppo_clip_ratio: float = 0.2 # probability-ratio clipping range
+    ppo_kl_coef: float = 0.1 # KL divergence penalty coefficient
+    ppo_vf_coef: float = 0.5
     gamma: float = 0.99
     gae_lambda: float = 0.95
 
-    # Stage 3: GRPO
+    #3 GRPO
     grpo_learning_rate: float = 1e-5
-    grpo_num_epochs: int = 3
+    grpo_num_epochs: int = 3 # inner gradient epochs per problem batch
     grpo_steps: int = 500
+    grpo_group_size: int = 4 # G: candidate responses sampled per question
+    grpo_kl_coef: float = 0.04  # KL coefficient against reference policy
 
     output_dir: str = "./outputs"
     model_save_dir: str = "./models"
@@ -81,10 +95,7 @@ class Config:
     device: str = field(default_factory=lambda: "cuda" if torch.cuda.is_available() else "cpu")
     seed: int = 42
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  UTILITY FUNCTIONS
-# ══════════════════════════════════════════════════════════════════════════════
+#  Utilities
 
 def set_seed(seed: int):
     np.random.seed(seed)
@@ -156,10 +167,7 @@ def load_model_and_tokenizer(
 
     return model, tokenizer
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  DATA LOADING & PREPROCESSING
-# ══════════════════════════════════════════════════════════════════════════════
+#  Data Loading
 
 class GSM8KDataset:
     def __init__(self, tokenizer, max_seq_length: int = 512):
@@ -173,10 +181,16 @@ class GSM8KDataset:
             self.dataset = self._create_mock_dataset()
 
     def _create_mock_dataset(self) -> Dict[str, "Dataset"]:
+        # Mirrors the real GSM8K format: <<expr=result>> annotations + #### answer.
         mock_problems = [
             {
                 "question": "If James has 60 apples and gives 10 to Mia, how many does he have?",
-                "answer": "James starts with 60 apples. He gives 10 to Mia. So he has 60 - 10 = 50 apples.",
+                "answer": (
+                    "James starts with 60 apples.\n"
+                    "He gives 10 to Mia.\n"
+                    "So he has 60-10=<<60-10=50>>50 apples.\n"
+                    "#### 50"
+                ),
             }
             for _ in range(100)
         ]
@@ -217,25 +231,117 @@ class GSM8KDataset:
         return dataset
 
     def _preprocess_sft(self, example):
+        """
+        Tokenise a question/answer pair for SFT.
+        Labels are IGNORE_INDEX (-100) for every prompt token so the loss only applies to answer tokens.  Padding positions are also masked.
+        """
         question = example.get("question", example.get("problem", ""))
         answer = example.get("answer", "")
-        text = f"Question: {question}\n\nAnswer: {answer}"
+
+        prompt = f"Question: {question}\n\nAnswer: "
+        full_text = prompt + answer
+
+        # Tokenise the prompt separately to learn its exact token length.
+        # add_special_tokens=True matches the behaviour of the full-text call so that the BOS token (where present) is included in both counts.
+        prompt_len = len(
+            self.tokenizer(
+                prompt,
+                truncation=True,
+                max_length=self.max_seq_length,
+                add_special_tokens=True,
+            )["input_ids"]
+        )
+
         encoding = self.tokenizer(
-            text,
+            full_text,
             truncation=True,
             max_length=self.max_seq_length,
             padding="max_length",
             return_tensors=None,
         )
-        encoding["labels"] = encoding["input_ids"].copy()
+        input_ids = encoding["input_ids"]
+        pad_id = self.tokenizer.pad_token_id
+
+        # Mask prompt tokens and padding; copy answer token ids as labels.
+        labels = [IGNORE_INDEX] * len(input_ids)
+        for i in range(prompt_len, len(input_ids)):
+            if input_ids[i] != pad_id:
+                labels[i] = input_ids[i]
+
+        encoding["labels"] = labels
         return encoding
 
     def _parse_solution_steps(self, solution: str) -> List[str]:
-        return [s.strip() for s in solution.split("\n") if s.strip()]
+        """
+        Parse a GSM8K reference solution into individual reasoning steps.
+
+        GSM8K solutions separate steps with newlines and embed inline arithmetic in <<expr=result>> markers (e.g. "60-10=<<60-10=50>>50").  The final line is always "#### N".
+        Heuristic strategy (not human-validated):
+          1. Split on newlines.
+          2. Strip <<…>> annotations, keeping surrounding prose.
+          3. Drop empty lines; include "#### N" as the terminal step.
+        """
+        steps = []
+        for line in solution.split("\n"):
+            line = line.strip()
+            if not line:
+                continue
+            clean = re.sub(r"<<[^>]*>>", "", line).strip()
+            if clean:
+                steps.append(clean)
+        return steps
+
+
+# PRM dataset helpers
+
+def _check_annotation_consistency(step: str) -> bool:
+    """
+    Return True when every <<expr=result>> annotation in the step is numerically consistent.  Returns True when no annotation is present.
+    Uses a restricted eval limited to arithmetic characters to avoid arbitrary code execution.
+    """
+    for m in re.finditer(r"<<([^>]+)>>", step):
+        annotation = m.group(1)
+        if "=" not in annotation:
+            continue
+        expr_str, expected_str = annotation.rsplit("=", 1)
+        expr_str = expr_str.replace(",", "").strip()
+        expected_str = expected_str.replace(",", "").strip()
+        # Only evaluate expressions made of digits and arithmetic operators.
+        if not re.match(r"^[\d\s\+\-\*/\.\(\)]+$", expr_str):
+            continue
+        try:
+            computed = float(eval(expr_str, _SAFE_EVAL_GLOBALS))  # noqa: S307
+            expected = float(expected_str)
+            if abs(computed - expected) > 0.5:
+                return False
+        except Exception:
+            pass   # cannot evaluate; do not penalise
+    return True
+
+
+def _clarity_score(step: str) -> float:
+    """
+    Heuristic clarity proxy in [0,1] based on word count.
+    Very short (< 3 words) or very long (> 50 words) steps score lower. This is not validated annotation - it is a rough signal only.
+    """
+    n = len(step.split())
+    if n < 3:
+        return 0.3
+    if n <= 20:
+        return 0.9
+    if n <= 40:
+        return 0.75
+    return 0.6
 
 
 def create_prm_dataset(gsm8k_dataset: GSM8KDataset, tokenizer, config: Config):
-    train_data = gsm8k_dataset.get_train_dataset(max_samples=1000)
+    """
+    Build a step-level PRM training dataset from GSM8K reference solutions.
+    Steps come exclusively from gold (correct) solutions, so they receive correctness = 1.0 by default; this drops to 0.0 only when an inline <<expr=result>> annotation fails an arithmetic sanity check.
+    """
+    raw_dataset = gsm8k_dataset.dataset["train"]
+    max_samples = min(1000, len(raw_dataset))
+    raw_dataset = raw_dataset.select(range(max_samples))
 
     prm_data: Dict[str, list] = {
         "step_text": [],
@@ -246,47 +352,47 @@ def create_prm_dataset(gsm8k_dataset: GSM8KDataset, tokenizer, config: Config):
         "progress_label": [],
     }
 
-    logger.info("Creating PRM dataset …")
-    for example in tqdm(train_data, total=len(train_data)):
-        text = tokenizer.decode(example["input_ids"], skip_special_tokens=True)
-        if "Answer:" not in text:
+    logger.info("Creating PRM dataset from reference solutions (heuristic labels) …")
+    for example in tqdm(raw_dataset, total=len(raw_dataset)):
+        question = example.get("question", example.get("problem", ""))
+        answer = example.get("answer", "")
+        steps = gsm8k_dataset._parse_solution_steps(answer)
+        n = len(steps)
+        if n == 0:
             continue
-        problem, answer = text.split("Answer:", 1)
-        problem = problem.replace("Question:", "").strip()
-        answer = answer.strip()
-        steps = [s.strip() for s in answer.split("\n") if s.strip()]
+
         for i, step in enumerate(steps):
+            consistent = _check_annotation_consistency(step)
             prm_data["step_text"].append(step)
-            prm_data["problem_context"].append(problem)
-            prm_data["correctness_label"].append(1.0)
-            prm_data["math_validity_label"].append(1.0)
-            prm_data["clarity_label"].append(0.9)
-            prm_data["progress_label"].append(float(i) / max(len(steps), 1))
+            prm_data["problem_context"].append(question)
+            prm_data["correctness_label"].append(1.0 if consistent else 0.0)
+            prm_data["math_validity_label"].append(1.0 if consistent else 0.0)
+            prm_data["clarity_label"].append(_clarity_score(step))
+            prm_data["progress_label"].append(float(i + 1) / n)
 
     return Dataset.from_dict(prm_data)
 
-
-# ══════════════════════════════════════════════════════════════════════════════
 #  PROCESS REWARD MODEL
-# ══════════════════════════════════════════════════════════════════════════════
-
 class MultiAspectPRM(nn.Module):
-    """Process Reward Model with four specialised reward heads."""
+    """
+    Process Reward Model with four reward heads: correctness, math_validity,
+    clarity, progress.  The base model is kept frozen; only the projection
+    layer and heads are trained.
+    """
 
-    def __init__(self, base_model, hidden_size: int = 768, num_heads: int = 4, dropout: float = 0.1):
+    def __init__(self, base_model, hidden_size: int = 768, dropout: float = 0.1):
         super().__init__()
         self.base_model = base_model
-        self.hidden_size = hidden_size
-        self.num_heads = num_heads
 
-        model_hidden_size = base_model.config.hidden_size if hasattr(base_model, "config") else hidden_size
+        model_hidden_size = getattr(base_model.config, "hidden_size", hidden_size)
         self.projection = (
             nn.Linear(model_hidden_size, hidden_size)
-            if model_hidden_size != hidden_size else nn.Identity()
+            if model_hidden_size != hidden_size
+            else nn.Identity()
         )
         self.dropout = nn.Dropout(dropout)
 
-        def _head(d, dp):
+        def _head(d: int, dp: float) -> nn.Sequential:
             return nn.Sequential(
                 nn.Linear(d, d // 2), nn.ReLU(),
                 nn.Dropout(dp),
@@ -300,9 +406,11 @@ class MultiAspectPRM(nn.Module):
         self.reward_weights = nn.Parameter(torch.tensor([0.4, 0.3, 0.15, 0.15]))
 
     def to(self, *args, **kwargs):
-        # Only move the trainable heads; the frozen 4-bit base model is managed by bitsandbytes.
-        for module in (self.projection, self.dropout, self.correctness_head, self.math_validity_head, self.clarity_head, self.progress_head):
-            module.to(*args, **kwargs)
+        # Only move the trainable heads; the 4-bit base model is managed by bitsandbytes.
+        for m in (self.projection, self.dropout,
+                  self.correctness_head, self.math_validity_head,
+                  self.clarity_head, self.progress_head):
+            m.to(*args, **kwargs)
         self.reward_weights = nn.Parameter(self.reward_weights.to(*args, **kwargs))
         return self
 
@@ -318,18 +426,19 @@ class MultiAspectPRM(nn.Module):
 
         if attention_mask is not None:
             last_token_idx = attention_mask.sum(dim=1) - 1
-            step_embedding = last_hidden[
-                torch.arange(last_hidden.shape[0], device=last_hidden.device), last_token_idx
+            step_emb = last_hidden[
+                torch.arange(last_hidden.shape[0], device=last_hidden.device),
+                last_token_idx,
             ]
         else:
-            step_embedding = last_hidden[:, -1, :]
+            step_emb = last_hidden[:, -1, :]
 
-        step_embedding = self.dropout(self.projection(step_embedding))
+        step_emb = self.dropout(self.projection(step_emb))
 
-        correctness = self.correctness_head(step_embedding)
-        math_validity = self.math_validity_head(step_embedding)
-        clarity = self.clarity_head(step_embedding)
-        progress = self.progress_head(step_embedding)
+        correctness = self.correctness_head(step_emb)
+        math_validity = self.math_validity_head(step_emb)
+        clarity = self.clarity_head(step_emb)
+        progress = self.progress_head(step_emb)
 
         weights = F.softmax(self.reward_weights, dim=0)
         final_reward = (
@@ -345,13 +454,9 @@ class MultiAspectPRM(nn.Module):
             "math_validity": math_validity,
             "clarity": clarity,
             "progress": progress,
-            "weights": weights,
         }
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  STAGE 1: SFT TRAINER
-# ══════════════════════════════════════════════════════════════════════════════
+# SFT TRAINER
 
 class SFTTrainer:
     """Supervised Fine-Tuning on GSM8K using HuggingFace Trainer with LoRA adapters."""
@@ -417,13 +522,10 @@ class SFTTrainer:
         logger.info(f"SFT LoRA adapters saved to {model_path}")
         return self.model, self.tokenizer
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  STAGE 2: PRM TRAINER
-# ══════════════════════════════════════════════════════════════════════════════
+# PRM TRAINER
 
 class PRMTrainerClass:
-    """Train Process Reward Model on top of the SFT model."""
+    """Train Process Reward Model heads on top of the frozen SFT model."""
 
     def __init__(self, sft_model, tokenizer, config: Config):
         self.config = config
@@ -432,7 +534,6 @@ class PRMTrainerClass:
         self.prm = MultiAspectPRM(
             base_model=sft_model,
             hidden_size=config.prm_hidden_size,
-            num_heads=config.num_reward_heads,
             dropout=0.1,
         ).to(self.device)
         trainable_params = [p for p in self.prm.parameters() if p.requires_grad]
@@ -464,7 +565,7 @@ class PRMTrainerClass:
 
         for epoch in range(self.config.prm_epochs):
             total_loss = 0.0
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch + 1}")
+            progress_bar = tqdm(train_loader, desc=f"PRM Epoch {epoch + 1}")
             for batch in progress_bar:
                 raw = batch["step_text"]
                 if isinstance(raw, list):
@@ -501,7 +602,7 @@ class PRMTrainerClass:
                 progress_bar.set_postfix({"loss": f"{loss.item():.4f}"})
 
             avg_loss = total_loss / len(train_loader)
-            logger.info(f"Epoch {epoch + 1} — Average Loss: {avg_loss:.4f}")
+            logger.info(f"PRM Epoch {epoch + 1} — Average Loss: {avg_loss:.4f}")
 
         model_path = os.path.join(self.config.model_save_dir, "prm_model")
         os.makedirs(model_path, exist_ok=True)
@@ -509,46 +610,110 @@ class PRMTrainerClass:
         logger.info(f"PRM model saved to {model_path}")
         return self.prm
 
+# PPO TRAINER
 
-# ══════════════════════════════════════════════════════════════════════════════
-#  STAGE 3A: PPO TRAINER
-# ══════════════════════════════════════════════════════════════════════════════
+class ValueHead(nn.Module):
+    """
+    Scalar value head for PPO baseline estimation.
+    Takes a per-token hidden state of shape [T, H] and returns [T] value estimates.
+    """
+
+    def __init__(self, hidden_size: int, dropout: float = 0.1):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Dropout(dropout),
+            nn.Linear(hidden_size, hidden_size // 2),
+            nn.ReLU(),
+            nn.Linear(hidden_size // 2, 1),
+        )
+
+    def forward(self, hidden_state: torch.Tensor) -> torch.Tensor:
+        return self.net(hidden_state).squeeze(-1)
+
 
 class PPOTrainer:
-    """PPO training with PRM rewards."""
+    """
+    PPO training loop for a LoRA-adapted language model.
 
-    def __init__(self, policy_model, prm_model, tokenizer, config: Config, hf_token: Optional[str] = None):
+    policy_model  LoRA-adapted model being optimised.
+    ref_model     Frozen snapshot of the base model — provides the KL baseline.
+    prm_model     Process Reward Model; scores each completed response.
+    value_head    Small MLP trained alongside the policy to estimate per-token returns.
+
+    Objective (per token t in the response)
+      r_t  = π(a_t|s_t) / π_old(a_t|s_t)            probability ratio
+      L_CLIP = E[min(r_t A_t, clip(r_t, 1-self.config.ppo_clip_ratio, 1+self.config.ppo_clip_ratio) A_t)]
+      L_VF   = 0.5 * E[(V(s_t) − R_t)²]
+      L_KL   = β * (log π_cur − log π_ref)            sequence-level KL
+      L_total = −L_CLIP + c_vf · L_VF + L_KL
+
+    Rewards
+    The PRM score is placed on the final response token.  All other token rewards are 0.  GAE then propagates this terminal signal backwards using per-token value estimates.
+    """
+
+    def __init__(
+        self,
+        policy_model,
+        prm_model,
+        tokenizer,
+        config: Config,
+        hf_token: Optional[str] = None,
+    ):
         self.config = config
         self.device = config.device
         self.tokenizer = tokenizer
         self.policy_model = policy_model
         self.prm_model = prm_model
 
-        self.value_model = AutoModelForCausalLM.from_pretrained(
-            config.model_name,
-            torch_dtype=torch.float16 if config.use_4bit else torch.float32,
-            device_map="auto",
-            token=hf_token,
-        )
+        # Frozen reference policy — loaded with the same quantisation as the policy.
+        logger.info("Loading frozen reference model for PPO KL penalty …")
+        if config.use_4bit:
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                config.model_name, quantization_config=get_4bit_config(),
+                device_map="auto", token=hf_token,
+            )
+        else:
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                config.model_name, torch_dtype=torch.float16,
+                device_map="auto", token=hf_token,
+            )
+        for p in self.ref_model.parameters():
+            p.requires_grad_(False)
+        self.ref_model.eval()
+
+        # Value head (trained, not frozen).
+        hidden_size = getattr(policy_model.config, "hidden_size", config.prm_hidden_size)
+        self.value_head = ValueHead(hidden_size).to(self.device)
+
         self.optimizer = AdamW(
-            list(self.policy_model.parameters()) + list(self.value_model.parameters()),
+            [p for p in self.policy_model.parameters() if p.requires_grad]
+            + list(self.value_head.parameters()),
             lr=config.ppo_learning_rate,
         )
 
+    # Public API 
+
     def train(self, num_steps: int = 500):
-        logger.info(f"Starting PPO training for {num_steps} steps …")
+        logger.info(f"Starting PPO training for {num_steps} rollout steps …")
         gsm8k = GSM8KDataset(self.tokenizer, max_seq_length=self.config.max_seq_length)
-        test_dataset = gsm8k.get_test_dataset(max_samples=100)
+        raw_train = gsm8k.dataset["train"]
 
         for step in range(num_steps):
-            indices = np.random.choice(len(test_dataset), size=self.config.train_batch_size, replace=False)
-            batch_problems = test_dataset.select(indices.tolist())
+            indices = np.random.choice(
+                len(raw_train), size=self.config.train_batch_size, replace=False
+            )
+            batch_problems = [raw_train[int(i)] for i in indices]
+
             trajectories = self._generate_trajectories(batch_problems)
             rewards = self._compute_rewards(trajectories)
-            advantages = self._compute_advantages(rewards)
-            loss = self._ppo_update(trajectories, advantages)
+            advantages, returns = self._compute_gae(trajectories, rewards)
+
+            total_loss = 0.0
+            for _ in range(self.config.ppo_num_epochs):
+                total_loss = self._ppo_update(trajectories, advantages, returns)
+
             if (step + 1) % 50 == 0:
-                logger.info(f"Step {step + 1} — PPO Loss: {loss:.4f}")
+                logger.info(f"PPO step {step + 1}/{num_steps} — loss: {total_loss:.4f}")
 
         model_path = os.path.join(self.config.model_save_dir, "ppo_model")
         os.makedirs(model_path, exist_ok=True)
@@ -557,25 +722,211 @@ class PPOTrainer:
         logger.info(f"PPO model saved to {model_path}")
         return self.policy_model
 
-    def _generate_trajectories(self, batch):
-        return [
-            {"text": self.tokenizer.decode(ex["input_ids"][:10]), "tokens": ex["input_ids"][:10]}
-            for ex in batch
-        ]
+    # Rollout generation
 
-    def _compute_rewards(self, trajectories):
-        return np.array([np.random.rand() for _ in trajectories])
+    def _generate_trajectories(self, batch_problems: List[Dict]) -> List[Dict]:
+        """
+        Generate one response per problem and record per-token log-probs under
+        both the current policy (used as π_old during the update) and the frozen
+        reference model (used for KL penalty).  Also records per-token value
+        estimates for GAE computation.
+        """
+        self.policy_model.eval()
+        device = next(self.policy_model.parameters()).device
+        trajectories = []
 
-    def _compute_advantages(self, rewards):
-        gae, returns = 0, []
-        for r in reversed(rewards):
-            gae = r + self.config.gamma * gae
-            returns.insert(0, gae)
-        returns = np.array(returns)
-        return returns - np.mean(returns)
+        with torch.no_grad():
+            for problem in batch_problems:
+                question = problem.get("question", problem.get("problem", ""))
+                prompt = f"Question: {question}\n\nAnswer:"
 
-    def _ppo_update(self, trajectories, advantages):
-        return torch.tensor(0.0, device=self.device).item()
+                prompt_enc = self.tokenizer(
+                    prompt, return_tensors="pt", truncation=True,
+                    max_length=self.config.max_seq_length // 2,
+                ).to(device)
+                prompt_len = prompt_enc["input_ids"].shape[1]
+
+                output_ids = self.policy_model.generate(
+                    **prompt_enc,
+                    max_new_tokens=min(128, self.config.max_seq_length - prompt_len),
+                    do_sample=True,
+                    temperature=0.7,
+                    pad_token_id=self.tokenizer.eos_token_id,
+                )
+
+                response_ids = output_ids[0, prompt_len:]
+                if response_ids.numel() == 0:
+                    continue
+
+                response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
+
+                # One forward pass for policy log-probs AND value estimates.
+                out = self.policy_model(input_ids=output_ids, output_hidden_states=True)
+                policy_lp = self._token_log_probs(out.logits[0], response_ids, prompt_len)
+                hidden = out.hidden_states[-1][0, prompt_len:].to(self.device)
+                values = self.value_head(hidden).detach()   # [resp_len]
+
+                # Reference log-probs (frozen).
+                ref_logits = self.ref_model(input_ids=output_ids).logits[0]
+                ref_lp = self._token_log_probs(ref_logits, response_ids, prompt_len)
+
+                trajectories.append({
+                    "question": question,
+                    "response_text": response_text,
+                    "response_ids": response_ids.cpu(),
+                    "output_ids": output_ids.cpu(),
+                    "prompt_len": prompt_len,
+                    "policy_log_probs": policy_lp.cpu(),   # π_old
+                    "ref_log_probs": ref_lp.cpu(),
+                    "values": values.cpu(),                # [resp_len]
+                })
+
+        self.policy_model.train()
+        return trajectories
+
+    # Reward computation
+
+    def _compute_rewards(self, trajectories: List[Dict]) -> List[torch.Tensor]:
+        """
+        Assign per-token rewards.
+        The PRM terminal score is placed on the final response token; all
+        other positions receive 0.  The GAE then propagates this signal
+        backwards through the per-token value estimates.
+        """
+        device = next(self.policy_model.parameters()).device
+        all_rewards = []
+        self.prm_model.eval()
+
+        with torch.no_grad():
+            for traj in trajectories:
+                resp_len = traj["response_ids"].shape[0]
+                token_rewards = torch.zeros(resp_len)
+
+                if resp_len > 0:
+                    enc = self.tokenizer(
+                        traj["response_text"], return_tensors="pt",
+                        truncation=True, max_length=self.config.max_seq_length,
+                    ).to(device)
+                    prm_out = self.prm_model(
+                        enc["input_ids"], attention_mask=enc.get("attention_mask")
+                    )
+                    token_rewards[-1] = prm_out["final_reward"].item()
+
+                all_rewards.append(token_rewards)
+
+        return all_rewards
+
+    # GAE
+
+    def _compute_gae(
+        self,
+        trajectories: List[Dict],
+        rewards: List[torch.Tensor],
+    ) -> Tuple[List[torch.Tensor], List[torch.Tensor]]:
+        all_advantages, all_returns = [], []
+
+        for traj, reward in zip(trajectories, rewards):
+            values = traj["values"]   # [T]
+            T = len(reward)
+            advantages = torch.zeros(T)
+            gae = 0.0
+            for t in reversed(range(T)):
+                next_val = values[t + 1].item() if t + 1 < T else 0.0
+                delta = reward[t].item() + self.config.gamma * next_val - values[t].item()
+                gae = delta + self.config.gamma * self.config.gae_lambda * gae
+                advantages[t] = gae
+            all_advantages.append(advantages)
+            all_returns.append(advantages + values)
+
+        return all_advantages, all_returns
+
+    # PPO gradient step
+
+    def _ppo_update(
+        self,
+        trajectories: List[Dict],
+        advantages: List[torch.Tensor],
+        returns: List[torch.Tensor],
+    ) -> float:
+        """
+        One inner epoch of clipped PPO updates across all trajectories.
+
+        For each trajectory:
+          1. Recompute current log-probs and value predictions via a fresh forward pass (so gradients flow through LoRA adapters).
+          2. Compute the clipped surrogate loss, value MSE loss, and KL penalty.
+          3. Back-propagate and clip gradients.
+        """
+        device = next(self.policy_model.parameters()).device
+        self.config.ppo_clip_ratio = self.config.ppo_clip_ratio
+        c_vf = self.config.ppo_vf_coef
+        total_loss = 0.0
+
+        self.policy_model.train()
+        self.value_head.train()
+
+        for traj, adv, ret in zip(trajectories, advantages, returns):
+            if traj["response_ids"].numel() == 0:
+                continue
+
+            output_ids = traj["output_ids"].to(device)
+            response_ids = traj["response_ids"].to(device)
+            prompt_len = traj["prompt_len"]
+            adv = adv.to(device)
+            ret = ret.to(device)
+
+            if adv.numel() > 1:
+                adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+
+            # Fresh forward pass — gradients flow through LoRA adapters.
+            out = self.policy_model(input_ids=output_ids, output_hidden_states=True)
+            cur_lp = self._token_log_probs(out.logits[0], response_ids, prompt_len)
+            hidden = out.hidden_states[-1][0, prompt_len:].to(device)
+            values_pred = self.value_head(hidden)   # [resp_len]
+
+            # Clipped surrogate loss.
+            old_lp = traj["policy_log_probs"].to(device)
+            ratio = torch.exp(cur_lp - old_lp)
+            surr1 = ratio * adv
+            surr2 = ratio.clamp(1.0 - self.config.ppo_clip_ratio, 1.0 + self.config.ppo_clip_ratio) * adv
+            policy_loss = -torch.min(surr1, surr2).mean()
+
+            # Value function loss.
+            value_loss = F.mse_loss(values_pred, ret)
+
+            # KL penalty: current policy vs frozen reference (sequence-level mean).
+            kl = (cur_lp - traj["ref_log_probs"].to(device)).mean()
+
+            loss = policy_loss + c_vf * value_loss + self.config.ppo_kl_coef * kl
+
+            self.optimizer.zero_grad()
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), 1.0)
+            torch.nn.utils.clip_grad_norm_(self.value_head.parameters(), 1.0)
+            self.optimizer.step()
+
+            total_loss += loss.item()
+
+        return total_loss / max(len(trajectories), 1)
+
+    @staticmethod
+    def _token_log_probs(
+        logits: torch.Tensor,
+        response_ids: torch.Tensor,
+        prompt_len: int,
+    ) -> torch.Tensor:
+        """
+        Extract per-token log-probs for the response tokens.
+
+        logits [seq_len, vocab] full sequence logits (prompt + response)
+        response_ids [resp_len]
+        prompt_len: token count of the prompt (including BOS if present)
+
+        Shifted indexing: logit at position t predicts token t+1, so the logit for the first response token is at index prompt_len − 1.
+        """
+        resp_len = response_ids.shape[0]
+        resp_logits = logits[prompt_len - 1: prompt_len - 1 + resp_len]   # [resp_len, vocab]
+        log_probs = F.log_softmax(resp_logits.float(), dim=-1)
+        return log_probs.gather(1, response_ids.unsqueeze(1)).squeeze(1)
 
 
 # ══════════════════════════════════════════════════════════════════════════════
@@ -583,30 +934,66 @@ class PPOTrainer:
 # ══════════════════════════════════════════════════════════════════════════════
 
 class GRPOTrainer:
-    """GRPO training with PRM rewards."""
+    """
+    GRPO (Group Relative Policy Optimization) training loop.
+    """
 
-    def __init__(self, policy_model, prm_model, tokenizer, config: Config, hf_token: Optional[str] = None):
+    def __init__(
+        self,
+        policy_model,
+        prm_model,
+        tokenizer,
+        config: Config,
+        hf_token: Optional[str] = None,
+    ):
         self.config = config
         self.device = config.device
         self.tokenizer = tokenizer
         self.policy_model = policy_model
         self.prm_model = prm_model
-        self.optimizer = AdamW(self.policy_model.parameters(), lr=config.grpo_learning_rate)
+
+        logger.info("Loading frozen reference model for GRPO KL penalty …")
+        if config.use_4bit:
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                config.model_name, quantization_config=get_4bit_config(),
+                device_map="auto", token=hf_token,
+            )
+        else:
+            self.ref_model = AutoModelForCausalLM.from_pretrained(
+                config.model_name, torch_dtype=torch.float16,
+                device_map="auto", token=hf_token,
+            )
+        for p in self.ref_model.parameters():
+            p.requires_grad_(False)
+        self.ref_model.eval()
+
+        self.optimizer = AdamW(
+            [p for p in self.policy_model.parameters() if p.requires_grad],
+            lr=config.grpo_learning_rate,
+        )
 
     def train(self, num_steps: int = 500):
         logger.info(f"Starting GRPO training for {num_steps} steps …")
         gsm8k = GSM8KDataset(self.tokenizer, max_seq_length=self.config.max_seq_length)
-        test_dataset = gsm8k.get_test_dataset(max_samples=100)
+        raw_train = gsm8k.dataset["train"]
+        G = self.config.grpo_group_size
 
         for step in range(num_steps):
-            indices = np.random.choice(len(test_dataset), size=self.config.train_batch_size, replace=False)
-            batch_problems = test_dataset.select(indices.tolist())
-            group_samples = self._generate_group_samples(batch_problems, num_samples=4)
-            group_rewards = self._compute_group_rewards(group_samples)
-            group_advantages = self._compute_group_advantages(group_rewards)
-            loss = self._grpo_update(group_samples, group_advantages)
+            indices = np.random.choice(
+                len(raw_train), size=self.config.train_batch_size, replace=False
+            )
+            batch_problems = [raw_train[int(i)] for i in indices]
+
+            groups = self._generate_group_samples(batch_problems, G)
+            groups = self._score_group_samples(groups)
+            groups = self._compute_group_advantages(groups)
+
+            total_loss = 0.0
+            for _ in range(self.config.grpo_num_epochs):
+                total_loss = self._grpo_update(groups)
+
             if (step + 1) % 50 == 0:
-                logger.info(f"Step {step + 1} — GRPO Loss: {loss:.4f}")
+                logger.info(f"GRPO step {step + 1}/{num_steps} — loss: {total_loss:.4f}")
 
         model_path = os.path.join(self.config.model_save_dir, "grpo_model")
         os.makedirs(model_path, exist_ok=True)
@@ -615,32 +1002,137 @@ class GRPOTrainer:
         logger.info(f"GRPO model saved to {model_path}")
         return self.policy_model
 
-    def _generate_group_samples(self, batch, num_samples: int = 4):
-        return [
-            [{"text": self.tokenizer.decode(ex["input_ids"][:10]), "tokens": ex["input_ids"][:10]}
-             for _ in range(num_samples)]
-            for ex in batch
-        ]
+    def _generate_group_samples(
+        self, batch_problems: List[Dict], G: int
+    ) -> List[Dict]:
+        """
+        Independently sample G candidate responses per problem.
+        Records per-token log-probs under both the current policy (π_old) and
+        the frozen reference (π_ref).
+        """
+        self.policy_model.eval()
+        device = next(self.policy_model.parameters()).device
+        groups = []
 
-    def _compute_group_rewards(self, group_samples):
-        return [np.array([np.random.rand() for _ in s]) for s in group_samples]
+        with torch.no_grad():
+            for problem in batch_problems:
+                question = problem.get("question", problem.get("problem", ""))
+                prompt = f"Question: {question}\n\nAnswer:"
+                prompt_enc = self.tokenizer(
+                    prompt, return_tensors="pt", truncation=True,
+                    max_length=self.config.max_seq_length // 2,
+                ).to(device)
+                prompt_len = prompt_enc["input_ids"].shape[1]
 
-    def _compute_group_advantages(self, group_rewards):
-        advantages = []
-        for rewards in group_rewards:
-            mean = np.mean(rewards)
-            std = np.std(rewards) + 1e-8
-            advantages.append((rewards - mean) / std)
-        return advantages
+                samples = []
+                for _ in range(G):
+                    output_ids = self.policy_model.generate(
+                        **prompt_enc,
+                        max_new_tokens=min(128, self.config.max_seq_length - prompt_len),
+                        do_sample=True,
+                        temperature=0.7,
+                        pad_token_id=self.tokenizer.eos_token_id,
+                    )
+                    response_ids = output_ids[0, prompt_len:]
+                    if response_ids.numel() == 0:
+                        continue
 
-    def _grpo_update(self, group_samples, group_advantages):
-        return torch.tensor(0.0, device=self.device).item()
+                    response_text = self.tokenizer.decode(response_ids, skip_special_tokens=True)
 
+                    pol_logits = self.policy_model(input_ids=output_ids).logits[0]
+                    pol_lp = PPOTrainer._token_log_probs(pol_logits, response_ids, prompt_len)
 
-# ══════════════════════════════════════════════════════════════════════════════
+                    ref_logits = self.ref_model(input_ids=output_ids).logits[0]
+                    ref_lp = PPOTrainer._token_log_probs(ref_logits, response_ids, prompt_len)
+
+                    samples.append({
+                        "response_text": response_text,
+                        "response_ids": response_ids.cpu(),
+                        "output_ids": output_ids.cpu(),
+                        "prompt_len": prompt_len,
+                        "policy_log_probs": pol_lp.cpu(),
+                        "ref_log_probs": ref_lp.cpu(),
+                    })
+
+                groups.append({"question": question, "samples": samples})
+
+        self.policy_model.train()
+        return groups
+
+    def _score_group_samples(self, groups: List[Dict]) -> List[Dict]:
+        """Score each response with the PRM and store the scalar reward."""
+        device = next(self.policy_model.parameters()).device
+        self.prm_model.eval()
+        with torch.no_grad():
+            for group in groups:
+                for sample in group["samples"]:
+                    enc = self.tokenizer(
+                        sample["response_text"], return_tensors="pt",
+                        truncation=True, max_length=self.config.max_seq_length,
+                    ).to(device)
+                    prm_out = self.prm_model(
+                        enc["input_ids"], attention_mask=enc.get("attention_mask")
+                    )
+                    sample["reward"] = prm_out["final_reward"].item()
+        return groups
+
+    def _compute_group_advantages(self, groups: List[Dict]) -> List[Dict]:
+        """
+        Normalise rewards within each group
+        """
+        for group in groups:
+            if not group["samples"]:
+                continue
+            rewards = np.array([s["reward"] for s in group["samples"]], dtype=np.float32)
+            mean = float(rewards.mean())
+            std = float(rewards.std()) + 1e-8
+            for s, r in zip(group["samples"], rewards):
+                s["advantage"] = (r - mean) / std
+        return groups
+
+    def _grpo_update(self, groups: List[Dict]) -> float:
+        """
+        One inner epoch of GRPO updates across all samples in all groups.
+        """
+        device = next(self.policy_model.parameters()).device
+        self.config.ppo_clip_ratio =    # same clip ratio as PPO
+        total_loss = 0.0
+        n_updates = 0
+
+        self.policy_model.train()
+        for group in groups:
+            for sample in group["samples"]:
+                if sample["response_ids"].numel() == 0:
+                    continue
+
+                output_ids = sample["output_ids"].to(device)
+                response_ids = sample["response_ids"].to(device)
+                prompt_len = sample["prompt_len"]
+                adv = torch.tensor(sample["advantage"], dtype=torch.float32, device=device)
+                old_lp = sample["policy_log_probs"].to(device)
+                ref_lp = sample["ref_log_probs"].to(device)
+
+                cur_logits = self.policy_model(input_ids=output_ids).logits[0]
+                cur_lp = PPOTrainer._token_log_probs(cur_logits, response_ids, prompt_len)
+
+                ratio = torch.exp(cur_lp - old_lp)
+                surr = torch.min(ratio * adv, ratio.clamp(1.0 - self.config.ppo_clip_ratio, 1.0 + self.config.ppo_clip_ratio) * adv)
+                policy_loss = -surr.mean()
+
+                kl = (cur_lp - ref_lp).mean()
+                loss = policy_loss + self.config.grpo_kl_coef * kl
+
+                self.optimizer.zero_grad()
+                loss.backward()
+                torch.nn.utils.clip_grad_norm_(self.policy_model.parameters(), 1.0)
+                self.optimizer.step()
+
+                total_loss += loss.item()
+                n_updates += 1
+
+        return total_loss / max(n_updates, 1)
+
 #  EVALUATION
-# ══════════════════════════════════════════════════════════════════════════════
-
 
 class Evaluator:
     """Evaluate model on GSM8K: cross-entropy loss and exact-match solve rate."""
@@ -649,8 +1141,6 @@ class Evaluator:
         self.model = model
         self.tokenizer = tokenizer
         self.config = config
-
-    # ── Loss ──────────────────────────────────────────────────────────────────
 
     def evaluate(self, test_dataset) -> float:
         """Average cross-entropy loss on a pre-tokenised dataset."""
@@ -670,13 +1160,12 @@ class Evaluator:
         logger.info(f"  Eval Loss : {avg_loss:.4f}")
         return avg_loss
 
-    # ── Solve rate ────────────────────────────────────────────────────────────
-
     def evaluate_accuracy(self, raw_dataset, max_samples: int = 200) -> float:
         """
-        Solve rate: fraction of problems where the model's final numeric answer matches the ground truth.  GSM8K answers always end with '#### <number>'.
+        Solve rate: fraction of problems where the model's numeric answer matches the ground truth within a tolerance of 1e-6.
+
+        GSM8K ground truth always contains a '#### <number>' marker.
         """
-        import re
         logger.info(f"Computing solve rate on {min(max_samples, len(raw_dataset))} problems …")
         self.model.eval()
         device = next(self.model.parameters()).device
@@ -695,19 +1184,18 @@ class Evaluator:
                 output_ids = self.model.generate(
                     **inputs,
                     max_new_tokens=256,
-                    do_sample=False,         # greedy — deterministic & faster
-                    temperature=1.0,
+                    do_sample=False,
                     pad_token_id=self.tokenizer.eos_token_id,
                 )
 
             generated = self.tokenizer.decode(
-                output_ids[0][inputs["input_ids"].shape[1]:],   # new tokens only
+                output_ids[0][inputs["input_ids"].shape[1]:],
                 skip_special_tokens=True,
             )
             predicted = self._extract_answer(generated)
 
             if ground_truth is not None and predicted is not None:
-                correct += int(predicted == ground_truth)
+                correct += int(abs(predicted - ground_truth) < 1e-6)
 
         solve_rate = correct / len(samples)
         logger.info(f"  Solve Rate: {solve_rate:.2%}  ({correct}/{len(samples)})")
@@ -716,21 +1204,28 @@ class Evaluator:
     @staticmethod
     def _extract_answer(text: str) -> Optional[float]:
         """
-        Pull the final numeric answer out of a GSM8K-style response.
-        Tries the canonical '#### <number>' marker first, then falls back to
-        the last number in the text.
+        Extract the final numeric answer from a GSM8K-style response.
+        Strategy:
+          1. Look for the canonical '#### <number>' marker and parse it.
+          2. Fall back to the last number found anywhere in the text.
+        Commas are stripped from all candidates.
+        Returns None if no number can be parsed.
         """
-        import re
-        match = re.search(r"####\s*([\d,.\-]+)", text)
-        if match:
+        # Canonical marker.
+        m = re.search(r"####\s*([\d,.\-]+)", text)
+        if m:
             try:
-                return float(match.group(1).replace(",", ""))
+                return float(m.group(1).replace(",", ""))
             except ValueError:
                 pass
-        numbers = re.findall(r"-?\d+\.?\d*", text.replace(",", ""))
-        return float(numbers[-1]) if numbers else None
-
-    # ── Sample generation ─────────────────────────────────────────────────────
+        # Fallback: last number in the text (handles plain numeric answers).
+        numbers = re.findall(r"-?\d[\d,]*\.?\d*", text)
+        for candidate in reversed(numbers):
+            try:
+                return float(candidate.replace(",", ""))
+            except ValueError:
+                continue
+        return None
 
     def generate_sample(self, prompt: str, max_new_tokens: int = 256) -> str:
         device = next(self.model.parameters()).device
@@ -746,21 +1241,14 @@ class Evaluator:
 
 
 def _log_metrics(stage: str, eval_loss: float, solve_rate: float):
-    """Log actual evaluation results for the given stage."""
     logger.info(
         f"\n  {'Metric':<14} {'Value':>8}\n"
-        f"  {'─'*24}\n"
+        f"  {'─' * 24}\n"
         f"  {'Eval loss':<14} {eval_loss:>8.4f}\n"
         f"  {'Solve rate':<14} {solve_rate:>8.2%}"
     )
 
-
-# ══════════════════════════════════════════════════════════════════════════════
-#  MAIN PIPELINE
-# ══════════════════════════════════════════════════════════════════════════════
-
 def _run_evaluation(stage: str, model, tokenizer, config: Config):
-    """Run loss + accuracy evaluation and log results vs expected ranges."""
     logger.info("=" * 50 + f"\nEVALUATION — {stage.upper()}\n" + "=" * 50)
     gsm8k = GSM8KDataset(tokenizer, max_seq_length=config.max_seq_length)
     evaluator = Evaluator(model, tokenizer, config)
@@ -800,7 +1288,7 @@ def run_pipeline(
         prm_model = prm_trainer.train()
     else:
         logger.info("Initialising PRM without training …")
-        prm_model = MultiAspectPRM(sft_model)
+        prm_model = MultiAspectPRM(sft_model, hidden_size=config.prm_hidden_size)
 
     if stage in ("ppo", "all"):
         logger.info("=" * 50 + "\nSTAGE 3A: PPO TRAINING\n" + "=" * 50)
@@ -819,10 +1307,14 @@ def run_pipeline(
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="RLHF Pipeline for GSM8K")
-    parser.add_argument("--stage", default="all", choices=["sft", "prm", "ppo", "grpo", "all"], help="Pipeline stage to run (default: all)")
-    parser.add_argument("--model", default="meta-llama/Llama-3.2-3B",help="HuggingFace model ID")
-    parser.add_argument("--output-dir", default="./outputs",help="Output directory (default: ./outputs)")
-    parser.add_argument("--no-4bit", action="store_true",help="Disable 4-bit quantization")
+    parser.add_argument(
+        "--stage", default="all",
+        choices=["sft", "prm", "ppo", "grpo", "all"],
+        help="Pipeline stage to run (default: all)",
+    )
+    parser.add_argument("--model", default="meta-llama/Llama-3.2-3B")
+    parser.add_argument("--output-dir", default="./outputs")
+    parser.add_argument("--no-4bit", action="store_true")
     args = parser.parse_args()
 
     hf_token = os.environ.get("HF_TOKEN")
